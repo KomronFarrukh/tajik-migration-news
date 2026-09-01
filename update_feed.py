@@ -1,113 +1,92 @@
 #!/usr/bin/env python3
-import json, re, urllib.parse, urllib.request
+import json
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime, format_datetime
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
-CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+CONFIG_PATH = ROOT / "config.json"
 FEED_PATH = ROOT / "feed.xml"
+MRSS = "http://search.yahoo.com/mrss/"
+NS = {"media": MRSS}
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 TajikMigrationRSS/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
 
-def norm(s):
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def error(message):
+    print("ERROR:", message)
+    sys.exit(1)
 
-def relevant(title, description):
-    text = (title + " " + description).lower()
-    return any(k.lower() in text for k in CONFIG["relevance_keywords"])
 
-def google_news_url(query):
-    q = urllib.parse.quote(query)
-    return f"https://news.google.com/rss/search?q={q}&hl=ru&gl=RU&ceid=RU:ru"
+def valid_url(value):
+    try:
+        parsed = urlparse(value or "")
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
 
-def load_existing():
-    existing = {}
-    if not FEED_PATH.exists():
-        return existing
+
+def main():
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        error(f"Invalid config.json: {exc}")
+
+    for section in ("feed", "editorial_language", "editorial_interests", "editorial_safety", "images"):
+        if section not in config:
+            error(f"Missing config section: {section}")
+
     try:
         root = ET.parse(FEED_PATH).getroot()
-        for item in root.findall("./channel/item"):
-            link = norm(item.findtext("link"))
-            if link:
-                existing[link] = {
-                    "title": norm(item.findtext("title")),
-                    "link": link,
-                    "guid": norm(item.findtext("guid")) or link,
-                    "pubDate": norm(item.findtext("pubDate")),
-                    "description": norm(item.findtext("description")),
-                    "categories": [norm(x.text) for x in item.findall("category") if norm(x.text)],
-                    "source": norm(item.findtext("source"))
-                }
-    except Exception:
-        pass
-    return existing
+    except Exception as exc:
+        error(f"Invalid feed.xml: {exc}")
 
-def collect():
-    found = {}
-    for search in CONFIG["searches"]:
-        try:
-            root = ET.fromstring(fetch(google_news_url(search["query"])))
-        except Exception as e:
-            print("WARN", search["query"], e)
-            continue
-        for item in root.findall("./channel/item"):
-            title = norm(item.findtext("title"))
-            link = norm(item.findtext("link"))
-            desc = norm(re.sub("<[^>]+>", " ", item.findtext("description") or ""))
-            pub = norm(item.findtext("pubDate"))
-            source = norm(item.findtext("source"))
-            if not title or not link or not relevant(title, desc):
-                continue
-            found[link] = {
-                "title": title,
-                "link": link,
-                "guid": link,
-                "pubDate": pub,
-                "description": desc or f"Новая публикация по теме миграции. Источник: {source or 'Google News'}.",
-                "categories": [search["country"], search["topic"]],
-                "source": source or "Google News"
-            }
-    return found
+    if root.tag != "rss" or root.attrib.get("version") != "2.0":
+        error("RSS 2.0 required")
 
-def date_key(item):
-    try:
-        return parsedate_to_datetime(item["pubDate"]).timestamp()
-    except Exception:
-        return 0
+    channel = root.find("channel")
+    if channel is None:
+        error("Missing channel")
 
-def write_feed(items):
-    rss = ET.Element("rss", {"version": "2.0"})
-    ch = ET.SubElement(rss, "channel")
-    ET.SubElement(ch, "title").text = CONFIG["feed"]["title"]
-    ET.SubElement(ch, "link").text = "https://news.google.com/"
-    ET.SubElement(ch, "description").text = CONFIG["feed"]["description"]
-    ET.SubElement(ch, "language").text = CONFIG["feed"]["language"]
-    ET.SubElement(ch, "lastBuildDate").text = format_datetime(datetime.now(timezone.utc))
-    ET.SubElement(ch, "ttl").text = "180"
+    if (channel.findtext("language") or "").strip() != config["feed"]["language"]:
+        error("Feed language differs from config")
 
-    for x in sorted(items.values(), key=date_key, reverse=True)[:CONFIG["feed"]["max_items"]]:
-        it = ET.SubElement(ch, "item")
-        ET.SubElement(it, "title").text = x["title"]
-        ET.SubElement(it, "link").text = x["link"]
-        ET.SubElement(it, "guid", {"isPermaLink": "true"}).text = x.get("guid") or x["link"]
-        if x.get("pubDate"):
-            ET.SubElement(it, "pubDate").text = x["pubDate"]
-        for c in x.get("categories", []):
-            ET.SubElement(it, "category").text = c
-        ET.SubElement(it, "source").text = x.get("source") or "Источник"
-        ET.SubElement(it, "description").text = x.get("description") or ""
+    items = channel.findall("item")
+    if len(items) > int(config["feed"].get("max_items", 120)):
+        error("Too many feed items")
 
-    tree = ET.ElementTree(rss)
-    ET.indent(tree, space="  ")
-    tree.write(FEED_PATH, encoding="utf-8", xml_declaration=True)
+    seen_links = set()
+    seen_guids = set()
 
-existing = load_existing()
-new = collect()
-existing.update(new)
-write_feed(existing)
-print(f"Feed updated: {len(existing)} unique items")
+    for i, item in enumerate(items, 1):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        guid = (item.findtext("guid") or "").strip()
+        source = (item.findtext("source") or "").strip()
+        description = (item.findtext("description") or "").strip()
+
+        if not title or not source or not description:
+            error(f"Item {i} has an empty required field")
+        if not valid_url(link):
+            error(f"Item {i} has an invalid link")
+        if not guid:
+            error(f"Item {i} has no guid")
+        if link in seen_links or guid in seen_guids:
+            error(f"Item {i} duplicates an existing item")
+        seen_links.add(link)
+        seen_guids.add(guid)
+
+        media = item.findall("media:content", NS)
+        image_enclosures = [x for x in item.findall("enclosure") if x.attrib.get("type", "").startswith("image/")]
+        if len(media) > 1 or len(image_enclosures) > 1:
+            error(f"Item {i} has more than one image")
+        for node in media + image_enclosures:
+            image_url = node.attrib.get("url", "")
+            if image_url and not valid_url(image_url):
+                error(f"Item {i} has an invalid image URL")
+
+    print(f"OK: feed.xml validated ({len(items)} items)")
+    print("No news was fetched or added by this script.")
+
+
+if __name__ == "__main__":
+    main()
